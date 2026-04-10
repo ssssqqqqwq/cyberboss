@@ -77,9 +77,17 @@ class CodexRpcClient {
         }
       }
     });
+    // Consume stderr to prevent the child process from blocking on a full
+    // stderr pipe buffer, which can cause it to stall or exit prematurely.
+    child.stderr.resume();
     child.on("close", () => {
       this.isReady = false;
     });
+
+    // Wait until stdin is confirmed writable before returning, so that the
+    // first sendRaw() call (during initialize()) does not race against the
+    // OS finishing the pipe setup inside the container.
+    await waitForWritableStdin(child);
   }
 
   async connectWebSocket() {
@@ -231,10 +239,23 @@ class CodexRpcClient {
       this.socket.send(payload);
       return;
     }
-    if (!this.child || !this.child.stdin.writable) {
-      throw new Error("Codex process stdin is not writable");
+    if (!this.child) {
+      throw new Error("Codex process is not running");
     }
-    this.child.stdin.write(`${payload}\n`);
+    if (!this.child.stdin || !this.child.stdin.writable) {
+      throw new Error(
+        "Codex process stdin is not writable — the child process may have exited or the pipe was not established correctly"
+      );
+    }
+    this.child.stdin.write(`${payload}\n`, (err) => {
+      if (err) {
+        // Surface write errors as unhandled so callers can observe them via
+        // the pending-request rejection path on the next event loop tick.
+        process.nextTick(() => {
+          throw err;
+        });
+      }
+    });
   }
 
   handleIncoming(rawMessage) {
@@ -387,6 +408,49 @@ function normalizeWritableRoots(values) {
     roots.push(normalized);
   }
   return roots;
+}
+
+/**
+ * Waits until the child process stdin stream is writable, polling with
+ * exponential back-off up to a hard timeout. This is necessary in some
+ * container environments (e.g. Railway) where the OS pipe is not immediately
+ * ready after spawn() returns.
+ *
+ * @param {import("child_process").ChildProcess} child
+ * @param {number} [timeoutMs=10000]
+ * @returns {Promise<void>}
+ */
+async function waitForWritableStdin(child, timeoutMs = 10_000) {
+  if (child.stdin && child.stdin.writable) {
+    return;
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let delay = 20; // ms — start small, double each iteration
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 2, 500);
+
+    if (!child.stdin) {
+      throw new Error(
+        "Codex process has no stdin stream — ensure stdio is configured with a pipe for stdin"
+      );
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(
+        `Codex process exited (code=${child.exitCode}, signal=${child.signalCode}) before stdin became writable`
+      );
+    }
+    if (child.stdin.writable) {
+      return;
+    }
+  }
+
+  throw new Error(
+    `Codex process stdin did not become writable within ${timeoutMs}ms — ` +
+    "the process may have exited or the container environment does not support piped stdin"
+  );
 }
 
 module.exports = { CodexRpcClient };
